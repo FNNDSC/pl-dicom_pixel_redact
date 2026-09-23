@@ -19,18 +19,18 @@ def get_version(rel_path: str) -> str:
 
 
 setup(
-    name='chris-plugin-template',
-    version=get_version('app.py'),
-    description='A ChRIS DS plugin template',
+    name='dicom_pixel_redact',
+    version=get_version('dicom_pixel_redact.py'),
+    description='A ChRIS plugin to detect and redact PHI embedded in DICOM pixel data using Microsoft Presidio',
     author='FNNDSC',
     author_email='dev@babyMRI.org',
-    url='https://github.com/FNNDSC/python-chrisapp-template',
-    py_modules=['app'],
+    url='https://github.com/FNNDSC/pl-dicom_pixel_re',
+    py_modules=['dicom_pixel_redact'],
     install_requires=['chris_plugin'],
     license='MIT',
     entry_points={
         'console_scripts': [
-            'commandname = app:main'
+            'dicom_pixel_redact = dicom_pixel_redact:main'
         ]
     },
     classifiers=[
