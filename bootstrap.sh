@@ -15,9 +15,9 @@
 # ----------------------------------------
 
 PLUGIN_NAME="$(basename $(dirname $(realpath $0)))"  # name of current directory
-PLUGIN_TITLE='My ChRIS Plugin'
-SCRIPT_NAME='commandname'
-DESCRIPTION='A ChRIS plugin to do something awesome'
+PLUGIN_TITLE='A ChRIS plugin to detect and redact PHI embedded in DICOM pixel data'
+SCRIPT_NAME='dicom_pixel_redact'
+DESCRIPTION='A ChRIS plugin to detect and redact PHI embedded in DICOM pixel data using Microsoft Presidio'
 ORGANIZATION='FNNDSC'
 EMAIL='dev@babyMRI.org'
 
@@ -46,7 +46,7 @@ ENABLE_ACTIONS_BUILD=yes
 # STEP 2. Uncomment the line where it says READY=yes
 # ----------------------------------------
 
-#READY=yes
+READY=yes
 
 # ----------------------------------------
 # STEP 3. Run: ./bootstrap.sh
