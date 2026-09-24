@@ -7,6 +7,11 @@ LABEL org.opencontainers.image.authors="FNNDSC <dev@babyMRI.org>" \
       org.opencontainers.image.title="A ChRIS plugin to detect and redact PHI embedded in DICOM pixel data" \
       org.opencontainers.image.description="A ChRIS plugin to detect and redact PHI embedded in DICOM pixel data using Microsoft Presidio"
 
+# Tesseract OCR is required by presidio-image-redactor for burned-in text detection.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tesseract-ocr libgl1 && \
+    rm -rf /var/lib/apt/lists/*
+
 ARG SRCDIR=/usr/local/src/pl-dicom_pixel_redact
 WORKDIR ${SRCDIR}
 
@@ -15,7 +20,8 @@ RUN --mount=type=cache,sharing=private,target=/root/.cache/pip pip install -r re
 
 COPY . .
 ARG extras_require=none
-RUN pip install ".[${extras_require}]" \
+RUN pip install ".[${extras_require}]" && \
+    python -m spacy download en_core_web_lg \
     && cd / && rm -rf ${SRCDIR}
 WORKDIR /
 
