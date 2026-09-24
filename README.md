@@ -5,12 +5,36 @@
 [![ci](https://github.com/FNNDSC/pl-dicom_pixel_redact/actions/workflows/ci.yml/badge.svg)](https://github.com/FNNDSC/pl-dicom_pixel_redact/actions/workflows/ci.yml)
 
 `pl-dicom_pixel_redact` is a [_ChRIS_](https://chrisproject.org/)
-_ds_ plugin which takes in ...  as input files and
-creates ... as output files.
+_ds_ plugin which takes a directory of **DICOM files with PHI burned into
+their pixel data** (e.g. an ultrasound or secondary-capture frame with the
+patient's name, MRN, or DOB rendered directly onto the image) as input files
+and creates a directory of the same DICOMs, with that burned-in PHI
+**redacted from the pixels**, as output files.
 
 ## Abstract
 
-...
+Some DICOM images carry identifying information not just in header tags, but
+burned directly into the pixels themselves — this is common on ultrasound,
+secondary-capture, and scanned-in images, and it's invisible to any tool that
+only sanitizes DICOM metadata.
+
+`pl-dicom_pixel_redact` finds and blacks out that text using
+[Microsoft Presidio](https://microsoft.github.io/presidio/)'s
+`DicomImageRedactorEngine`: Tesseract OCR reads text off each frame, spaCy's
+NER model classifies it, and any span recognized as PHI gets redacted in
+place.
+
+On top of Presidio's default detection, this plugin also builds a **per-file
+recall boost** from each DICOM's own header: since a file's `PatientName`,
+`PatientID`, and similar tags are already known ground truth, an exact
+burned-in match against those values is flagged even when the general NER
+model wouldn't otherwise catch it (unusual name formats, MRNs, accession
+numbers, etc). This is on by default and can be tuned or disabled — see
+`--metadata-recall` below.
+
+**Scope note:** this plugin only redacts *pixel* data. It does not modify
+PHI living in DICOM metadata tags (`PatientName`, `PatientID`, ...) — pair it
+with a tag-scrubbing plugin for full de-identification.
 
 ## Installation
 
@@ -40,9 +64,38 @@ First, create the input directory and move input data into it.
 
 ```shell
 mkdir incoming/ outgoing/
-mv some.dat other.dat incoming/
-apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact [--args] incoming/ outgoing/
+mv patient1.dcm patient2.dcm incoming/
+
+apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact incoming/ outgoing/
 ```
+
+By default, every `*.dcm` file found (recursively) under `incoming/` is
+scanned and redacted into a matching structure under `outgoing/`, using each
+file's own header (`PatientName`, `PatientID`, ...) to boost recall on top of
+Presidio's general PHI detection.
+
+A few common variations:
+
+```shell
+# only process files matching a narrower pattern
+apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
+    --pattern '**/*.dicom' incoming/ outgoing/
+
+# fill redacted regions by sampling the background instead of high-contrast black/white,
+# and save the redacted bounding boxes as JSON next to each output file
+apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
+    --fill background --save-bboxes incoming/ outgoing/
+
+# rely only on Presidio's general NER model, without the per-file header recall boost
+apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
+    --no-metadata-recall incoming/ outgoing/
+
+# also copy through any non-DICOM files found in the input directory
+apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
+    --copy-others incoming/ outgoing/
+```
+
+Run `dicom_pixel_redact --help` for the full list of options.
 
 ## Development
 
@@ -78,6 +131,18 @@ docker build -t localhost/fnndsc/pl-dicom_pixel_redact:dev --build-arg extras_re
 docker run --rm -it localhost/fnndsc/pl-dicom_pixel_redact:dev pytest
 ```
 
+Tests are split into two groups:
+
+- `tests/test_recall.py`, `tests/test_cli.py` — pure unit tests covering the
+  header-recall logic and argument parsing. No OCR, no spaCy model, no
+  Tesseract; fast, and run in any environment.
+- `tests/test_integration.py` — runs the plugin end-to-end against synthetic
+  DICOMs with burned-in PHI text, through the real Tesseract + spaCy +
+  Presidio pipeline, and checks the redacted pixels no longer OCR back to the
+  original name/ID. It skips itself (rather than failing) if `tesseract` or
+  the `en_core_web_lg` spaCy model aren't available, so it degrades
+  gracefully outside the `:dev` image.
+
 ## Release
 
 Steps for release can be automated by [Github Actions](.github/workflows/ci.yml).
@@ -85,7 +150,7 @@ This section is about how to do those steps manually.
 
 ### Increase Version Number
 
-Increase the version number in `setup.py` and commit this file.
+Increase the version number in `dicom_pixel_redact.py` (`__version__`) and commit this file.
 
 ### Push Container Image
 
