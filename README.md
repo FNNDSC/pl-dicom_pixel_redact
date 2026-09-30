@@ -130,16 +130,39 @@ docker run --rm -it --userns=host -u $(id -u):$(id -g) \
     localhost/fnndsc/pl-dicom_pixel_redact dicom_pixel_redact /incoming /outgoing
 ```
 
-### Testing
+## Testing
 
-Run unit tests using `pytest`.
-It's recommended to rebuild the image to ensure that sources are up-to-date.
-Use the option `--build-arg extras_require=dev` to install extra dependencies for testing.
+### Install development dependencies
 
-```shell
-docker build -t localhost/fnndsc/pl-dicom_pixel_redact:dev --build-arg extras_require=dev .
-docker run --rm -it localhost/fnndsc/pl-dicom_pixel_redact:dev pytest
+```bash
+pip install -r requirements.txt
+pip install -e .
+pip install pytest
 ```
+
+### Run the test suite
+
+```bash
+pytest -v
+```
+
+or run a specific test:
+
+```bash
+pytest tests/test_recall.py -v
+```
+
+### Test inside Docker
+
+```bash
+docker build --build-arg extras_require=dev -t pl-dicom_pixel_redact:dev .
+docker run --rm \
+    -v "$PWD:/app:ro" \
+    -w /app \
+    pl-dicom_pixel_redact:dev \
+    pytest -v -o cache_dir=/tmp/pytest
+```
+
 
 Tests are split into two groups:
 
