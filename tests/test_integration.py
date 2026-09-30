@@ -1,4 +1,4 @@
-"""Integration test for app.py's `main()`.
+"""Integration test for dicom_pixel_redact.py's `main()`.
 
 Unlike test_recall.py / test_cli.py, this actually runs the full pipeline:
 Tesseract OCR -> spaCy NER -> Presidio redaction -> pixel data rewritten.

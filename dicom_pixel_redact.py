@@ -21,9 +21,9 @@ from presidio_analyzer import PatternRecognizer
 from chris_plugin import chris_plugin, PathMapper
 
 logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-    )
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
 log = logging.getLogger(__name__)
 
 
@@ -229,6 +229,8 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
     """
 
     print(DISPLAY_TITLE)
+    if options.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     # Typically it's easier to think of programs as operating on individual files
     # rather than directories. The helper functions provided by a ``PathMapper``
@@ -258,7 +260,8 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
                 header = pydicom.dcmread(str(input_file), stop_before_pixels=True, force=True)
                 recognizer = build_recall_recognizer(header, recall_tags, options.recall_min_len)
             except Exception as e:
-                log.debug('Could not read header of %s for recall: %s', input_file, e)
+                log.warning('Could not read header of %s for metadata recall '
+                            '(falling back to generic detection): %s', input_file, e)
                 recognizer = None
             if recognizer is not None:
                 extra_kwargs['ad_hoc_recognizers'] = [recognizer]
@@ -303,6 +306,12 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
             "No files matched pattern '%s' under %s -- did you mean to pass "
             "a different --pattern?", options.pattern, inputdir
         )
+    if n_failed:
+        # Fail closed: a file we could not scrub is never written to the
+        # output, and the job must not look successful to downstream plugins.
+        log.error('%d file(s) could NOT be redacted and were not written to %s.',
+                  n_failed, outputdir)
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

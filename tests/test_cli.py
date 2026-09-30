@@ -1,4 +1,4 @@
-"""Unit tests for app.py's argparse surface.
+"""Unit tests for dicom_pixel_redact.py's argparse surface.
 
 Doesn't import presidio/pydicom-heavy code paths -- just exercises
 `app.parser`, which is safe/fast to construct.

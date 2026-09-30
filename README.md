@@ -97,6 +97,16 @@ apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
 
 Run `dicom_pixel_redact --help` for the full list of options.
 
+### Exit status and failures
+
+If any file cannot be redacted (corrupt DICOM, OCR error, ...), the plugin
+keeps processing the remaining files, **does not write the failed file to the
+output directory** (nothing un-redacted is ever passed through, including with
+`--copy-others`), and exits with status `1`. Check the log for
+`Failed to scrub ...` lines. If only the *header* cannot be read for
+`--metadata-recall`, the file is still redacted using Presidio's generic
+detection and a warning is logged.
+
 ## Development
 
 Instructions for developers.
@@ -133,8 +143,10 @@ docker run --rm -it localhost/fnndsc/pl-dicom_pixel_redact:dev pytest
 
 Tests are split into two groups:
 
-- `tests/test_recall.py`, `tests/test_cli.py` — pure unit tests covering the
-  header-recall logic and argument parsing. No OCR, no spaCy model, no
+- `tests/test_recall.py`, `tests/test_cli.py`, `tests/test_failures.py` — pure
+  unit tests covering the header-recall logic, argument parsing, and failure
+  handling (corrupt files, fail-closed output, exit codes, recall fallback;
+  the Presidio engine is faked). No OCR, no spaCy model, no
   Tesseract; fast, and run in any environment.
 - `tests/test_integration.py` — runs the plugin end-to-end against synthetic
   DICOMs with burned-in PHI text, through the real Tesseract + spaCy +

@@ -21,7 +21,7 @@ RUN --mount=type=cache,sharing=private,target=/root/.cache/pip pip install -r re
 COPY . .
 ARG extras_require=none
 RUN pip install ".[${extras_require}]" && \
-    python -m spacy download en_core_web_lg \
+    pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl \
     && cd / && rm -rf ${SRCDIR}
 WORKDIR /
 

@@ -1,4 +1,4 @@
-"""Unit tests for the metadata-recall helpers in app.py.
+"""Unit tests for the metadata-recall helpers in dicom_pixel_redact.py.
 
 These are pure-logic tests: no OCR, no spaCy model, no Tesseract, no file
 I/O. They run fast and should pass in any environment with
