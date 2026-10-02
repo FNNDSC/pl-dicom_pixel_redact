@@ -4,6 +4,8 @@ These are pure-logic tests: no OCR, no spaCy model, no Tesseract, no file
 I/O. They run fast and should pass in any environment with
 requirements.txt installed (in particular: pydicom, presidio-analyzer).
 """
+import sys
+
 import pytest
 from pydicom.dataset import Dataset
 

@@ -49,6 +49,7 @@ def make_synthetic_dicom(
     patient_name: str,
     patient_id: str,
     burned_text: str,
+    with_pixel_data: bool = True,
 ) -> None:
     """Write a small single-frame DICOM whose pixel data has `burned_text`
     rendered onto it as white text on a dark background -- a stand-in for a
@@ -58,12 +59,16 @@ def make_synthetic_dicom(
 
     import numpy as np
     import pydicom
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
     from pydicom.dataset import FileDataset, FileMetaDataset
     from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage
 
-    img = Image.new('L', (400, 300), color=20)
-    ImageDraw.Draw(img).text((10, 10), burned_text, fill=255)
+    img = Image.new('L', (800, 300), color=20)
+    try:  # Pillow's tiny default bitmap font OCRs poorly; sized default needs >=10.1
+        font = ImageFont.load_default(size=32)
+    except TypeError:
+        font = ImageFont.load_default()
+    ImageDraw.Draw(img).text((10, 10), burned_text, fill=255, font=font)
     arr = np.array(img)
 
     meta = FileMetaDataset()
@@ -86,7 +91,8 @@ def make_synthetic_dicom(
     ds.BitsStored = 8
     ds.HighBit = 7
     ds.PixelRepresentation = 0
-    ds.PixelData = arr.tobytes()
+    if with_pixel_data:
+        ds.PixelData = arr.tobytes()
     ds.is_little_endian = True
     ds.is_implicit_VR = False
     ds.save_as(str(path), write_like_original=False)
@@ -99,6 +105,12 @@ def run_plugin(inputdir: Path, outputdir: Path, extra_args=None):
     # documented test pattern it can be invoked directly with
     # (options, inputdir, outputdir) for a ds-type plugin.
     app.main(options, inputdir, outputdir)
+
+
+def ocr_text(dataset) -> str:
+    import pytesseract
+    from PIL import Image
+    return pytesseract.image_to_string(Image.fromarray(dataset.pixel_array)).upper()
 
 
 class TestPixelRedaction:
@@ -122,20 +134,22 @@ class TestPixelRedaction:
         assert out_file.exists(), 'plugin should produce an output DICOM of the same name'
 
         import pydicom
-        import pytesseract
-        from PIL import Image
 
         original = pydicom.dcmread(str(dcm_path))
         redacted = pydicom.dcmread(str(out_file))
+
+        # positive control: OCR must be able to read the text in the INPUT,
+        # otherwise "not found in the output" below proves nothing
+        assert 'JANE' in ocr_text(original)
 
         # pixel data should have actually changed
         assert redacted.PixelData != original.PixelData
 
         # and OCR against the *output* pixels should no longer turn up the
         # patient's real name or ID
-        redacted_text = pytesseract.image_to_string(Image.fromarray(redacted.pixel_array))
-        assert 'JANE' not in redacted_text.upper()
-        assert 'MRN99887' not in redacted_text.upper()
+        redacted_text = ocr_text(redacted)
+        assert 'JANE' not in redacted_text
+        assert 'MRN99887' not in redacted_text
 
     def test_metadata_still_present_after_pixel_only_scrub(self, tmp_path):
         # documents the plugin's stated scope: pixel-only. Metadata tags
@@ -161,8 +175,9 @@ class TestPixelRedaction:
         assert str(redacted.PatientID) == 'MRN1'
 
     def test_no_metadata_recall_still_redacts_via_generic_ner(self, tmp_path):
-        # a common person's name should still get caught by Presidio's
-        # default NER model even with the header-based recall boost off.
+        # --no-metadata-recall turns off BOTH our header deny-list and
+        # Presidio's own (use_metadata=False), so this exercises NER alone.
+        # If this fails, NER recall on this font/size is the limitation.
         inputdir = tmp_path / 'in'
         outputdir = tmp_path / 'out'
         outputdir.mkdir()
@@ -183,7 +198,9 @@ class TestPixelRedaction:
         import pydicom
         original = pydicom.dcmread(str(dcm_path))
         redacted = pydicom.dcmread(str(out_file))
+        assert 'JOHN' in ocr_text(original)          # positive control
         assert redacted.PixelData != original.PixelData
+        assert 'JOHN' not in ocr_text(redacted)
 
     def test_copy_others_carries_non_matching_files_through(self, tmp_path):
         inputdir = tmp_path / 'in'
@@ -198,6 +215,8 @@ class TestPixelRedaction:
         run_plugin(inputdir, outputdir, extra_args=['--copy-others'])
 
         assert (outputdir / 'sample.dcm').exists()
+        assert (outputdir / 'sample.dcm').read_bytes() != dcm_path.read_bytes(), \
+            'the DICOM must be redacted, not just copied'
         assert (outputdir / 'notes.txt').read_text() == 'not a dicom'
 
     def test_no_matching_files_does_not_crash(self, tmp_path):
@@ -210,6 +229,31 @@ class TestPixelRedaction:
         # should log a warning and exit cleanly, not raise
         run_plugin(inputdir, outputdir)
         assert list(outputdir.iterdir()) == []
+
+
+class TestRealEngineFailClosed:
+    """The real engine copies its input into the output dir before it fails;
+    the plugin must make sure nothing un-redacted survives."""
+
+    def test_file_without_pixel_data_leaves_nothing_in_output(self, tmp_path):
+        inputdir, outputdir = tmp_path / 'in', tmp_path / 'out'
+        outputdir.mkdir()
+        make_synthetic_dicom(inputdir / 'nopix.dcm', 'DOE^JANE', 'MRN1',
+                             'JANE DOE', with_pixel_data=False)
+        with pytest.raises(SystemExit) as exc:
+            run_plugin(inputdir, outputdir)
+        assert exc.value.code == 1
+        assert list(outputdir.rglob('*')) == []
+
+    def test_truncated_pixel_data_leaves_nothing_in_output(self, tmp_path):
+        inputdir, outputdir = tmp_path / 'in', tmp_path / 'out'
+        outputdir.mkdir()
+        good = inputdir / 'trunc.dcm'
+        make_synthetic_dicom(good, 'DOE^JANE', 'MRN1', 'JANE DOE')
+        good.write_bytes(good.read_bytes()[:-5000])
+        with pytest.raises(SystemExit):
+            run_plugin(inputdir, outputdir)
+        assert list(outputdir.rglob('*')) == []
 
 
 if __name__ == '__main__':

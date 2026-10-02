@@ -44,17 +44,28 @@ class TestMetadataRecallFlag:
         opts = parse(['--no-metadata-recall'])
         assert opts.metadata_recall is False
 
-    def test_recall_alias_enables(self):
-        opts = parse(['--recall'])
-        assert opts.metadata_recall is True
+    def test_enabled_by_default(self):
+        assert parse([]).metadata_recall is True
 
-    def test_no_recall_alias_disables(self):
-        opts = parse(['--no-recall'])
-        assert opts.metadata_recall is False
+    def test_removed_aliases_are_rejected(self):
+        # BooleanOptionalAction (--metadata-recall/--no-recall...) is not
+        # supported by chris_plugin, so these must not exist.
+        for flag in ('--metadata-recall', '--recall', '--no-recall'):
+            with pytest.raises(SystemExit):
+                parse([flag])
 
-    def test_explicit_metadata_recall_enables(self):
-        opts = parse(['--metadata-recall'])
-        assert opts.metadata_recall is True
+
+class TestChrisDescriptor:
+
+    def test_parser_serializes_for_chris(self):
+        # chris_plugin_info runs this inside the image during release; an
+        # unsupported argparse Action raises TypeError there, *after* the
+        # image has already been pushed.
+        from chris_plugin.parameters import serialize
+        specs = serialize(app.parser)
+        by_flag = {spec['flag']: spec for spec in specs}
+        assert by_flag['--no-metadata-recall']['default'] is True
+        assert by_flag['--no-metadata-recall']['action'] == 'store_false'
 
 
 class TestOtherFlags:

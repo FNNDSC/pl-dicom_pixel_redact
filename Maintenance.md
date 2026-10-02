@@ -9,13 +9,14 @@ development are in [README.md](README.md).
 | File | Role |
 |---|---|
 | `requirements.txt` | Runtime dependencies, installed in the Docker image with `pip install -r`. Compatible-release ranges (`~=`), **not** a full lock. |
-| `setup.py` | `install_requires=['chris_plugin']`; extras `dev` adds `pytest`. |
+| `setup.py` | `install_requires` lists the runtime packages (unpinned); extras `dev` adds `pytest`. |
 | `Dockerfile` | Also installs the `en_core_web_lg` 3.8.0 spaCy model and the `tesseract-ocr` apt package. |
 
-Because `requirements.txt` uses ranges, two builds on different days can
-resolve different transitive versions (e.g. `presidio-image-redactor~=0.0.53`
-currently resolves to 0.0.60). Treat every rebuild as a dependency change:
-run the full test suite (below) before releasing.
+`chris_plugin` and `presidio-image-redactor` are pinned exactly (0.0.x
+releases of the latter have changed behaviour). The rest use compatible-release
+ranges, so two builds on different days can resolve different transitive
+versions. Treat every rebuild as a dependency change: run the full test suite
+(below) before releasing.
 
 ### Upgrading dependencies
 
@@ -26,11 +27,12 @@ run the full test suite (below) before releasing.
 
    ```shell
    docker build -t localhost/fnndsc/pl-dicom_pixel_redact:dev --build-arg extras_require=dev .
-   docker run --rm localhost/fnndsc/pl-dicom_pixel_redact:dev pytest -rs
+   docker run --rm -v "$PWD:/app:ro" -w /app localhost/fnndsc/pl-dicom_pixel_redact:dev pytest -rs
    ```
 
-   Check the `-rs` output: **no test should be skipped** inside the image.
-3. Run the vulnerability scan and regenerate the SBOM (below).
+   The mount is needed because the image does not contain `tests/`. Check the
+   `-rs` output: **no test should be skipped** inside the image.
+3. Run the vulnerability scan and regenerate the SBOM from the image (below).
 
 Watch-list:
 
@@ -56,23 +58,28 @@ with a comment saying why; then rebuild, retest, re-scan, regenerate the SBOM.
 
 ## SBOM
 
-`sbom.cdx.json` is a CycloneDX 1.6 inventory of what is installed at runtime.
-Regenerate it **from the built image** so it matches what ships:
+`sbom.cdx.json` should be a software bill of materials of **what is in the
+shipped image**, including OS packages such as `tesseract-ocr`, not just
+Python packages.
+
+Generate it from the built image, not from a separate virtualenv (a venv
+resolves different versions and records local paths):
 
 ```shell
-pip install cyclonedx-bom
-python -m venv /tmp/sbom-env
-/tmp/sbom-env/bin/pip install -r requirements.txt
-/tmp/sbom-env/bin/pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl
-/tmp/sbom-env/bin/pip install --no-deps .
-cyclonedx-py environment --output-reproducible --of json -o sbom.cdx.json /tmp/sbom-env/bin/python
+# whole image: Python packages and Debian packages (Tesseract, ...)
+syft docker.io/fnndsc/pl-dicom_pixel_redact:<version> -o cyclonedx-json=sbom.cdx.json
 ```
 
-Regenerate on every dependency change and before each release.
+Better still, produce it in CI on every tag, for example with
+`sbom: true` on `docker/build-push-action` or a `syft`/`trivy` step on the
+pushed tag, and attach it to the release.
 
-**Known gap:** the checked-in SBOM lists `pydicom 3.0.2`, while
-`requirements.txt` allows only `~=2.4`, so it was generated from a different
-environment than the Docker image. Regenerate before the next release.
+**Known problem:** the `sbom.cdx.json` currently checked in was produced by
+`cyclonedx-py environment` in a separate venv. It records a local
+`file:///home/claude/...` source path, lists 11 Python packages whose versions
+differ from the image (e.g. `pydicom 3.0.2` vs 2.4.x installed,
+`cryptography 50.0.1` vs 48.0.1) and has no OS packages. Treat it as
+inaccurate. Regenerate it as above, or delete it, before relying on it.
 
 ## Testing
 
@@ -80,18 +87,28 @@ environment than the Docker image. Regenerate before the next release.
 |---|---|---|
 | `tests/test_cli.py` | nothing | argument parsing and defaults |
 | `tests/test_recall.py` | nothing | header-derived deny-list logic |
-| `tests/test_failures.py` | nothing (engine is faked) | corrupt files, fail-closed output, exit code, recall fallback, option pass-through |
-| `tests/test_integration.py` | Tesseract, `en_core_web_lg` | real OCR → redaction on synthetic DICOMs |
+| `tests/test_failures.py` | nothing (engine is faked) | fail-closed output, unsupported input (multi-frame, compressed), exit codes, `--copy-others` refusals, option validation, recall wiring |
+| `tests/test_integration.py` | Tesseract, `en_core_web_lg` | real OCR → redaction on synthetic DICOMs, and real-engine failure cases |
+
+The fake engine in `test_failures.py` deliberately copies the input into its
+output directory *before* failing, like Presidio does. Keep it that way: a
+fake that fails before writing cannot detect an un-redacted leak.
+
+`test_cli.py` also runs `chris_plugin.parameters.serialize()` on the parser. An
+argparse action `chris_plugin` does not support (e.g. `BooleanOptionalAction`)
+would otherwise only fail during the release, after the image was pushed.
 
 CI runs everything inside the dev image, so the integration tests execute there.
 
 ## Releasing
 
 1. Confirm CI is green on `main` and no integration test was skipped.
-2. Run `pip-audit`; regenerate `sbom.cdx.json`.
-3. Bump `__version__` in `dicom_pixel_redact.py` (semver: behaviour or
-   exit-code changes are at least a minor bump).
-4. Merge, then tag and push: `git tag v1.0.1 && git push origin v1.0.1`.
+2. Run `pip-audit`; regenerate the SBOM from the image.
+3. Make sure `__version__` in `dicom_pixel_redact.py` is the version you are
+   about to tag. The ChRIS descriptor takes its version from it, so the tag
+   must match (`__version__ = '1.0.0'` → tag `v1.0.0`) or the store version and
+   image tag will disagree. Bump it only for versions after one has shipped.
+4. Merge, then tag and push: `git tag v1.0.0 && git push origin v1.0.0`.
 5. The tag triggers `.github/workflows/ci.yml`: it builds the image, pushes
    `latest` and the version tag to Docker Hub and ghcr.io, uploads the plugin
    to the ChRIS store (`cube.chrisproject.org`), and updates the Docker Hub
@@ -104,7 +121,9 @@ Manual fallback steps are in [README.md > Release](README.md#release).
 
 ## Scope reminder
 
-The plugin redacts **pixel** data only. DICOM header tags are left intact by
+See README > Limitations for what the plugin does not handle (multi-frame and
+compressed images are refused; OCR is best-effort). The plugin redacts
+**pixel** data only. DICOM header tags are left intact by
 design; pair with a tag-scrubbing plugin for full de-identification. OCR-based
 detection is best-effort: absence of a detection is not proof that an image is
 PHI-free, so spot-check output on new scanner types.
@@ -114,5 +133,7 @@ PHI-free, so spot-check output on new scanner types.
 - Move to a hash-locked `requirements.txt` (pip-tools) and install with
   `--require-hashes` in the Dockerfile.
 - Scheduled CI job running `pip-audit`.
+- Multi-frame support (redact frame by frame) and a per-file subprocess so
+  that a native crash in a codec cannot take down the whole batch.
 - Add `examples/incoming` / `examples/outgoing` so CI's "Run examples" step
   actually runs.

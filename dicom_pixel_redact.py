@@ -12,9 +12,13 @@ tag-scrubbing plugin (e.g. pl-pfdicom_anonymize, or pydicom-based tag removal)
 for full de-identification.
 """
 import logging
+import os
+import shutil
+import tempfile
 from pathlib import Path
-from argparse import ArgumentParser, Namespace, ArgumentDefaultsHelpFormatter, BooleanOptionalAction
+from argparse import ArgumentParser, Namespace, ArgumentDefaultsHelpFormatter
 import pydicom
+from pydicom.multival import MultiValue
 from presidio_image_redactor import DicomImageRedactorEngine
 from presidio_analyzer import PatternRecognizer
 
@@ -89,10 +93,14 @@ def extract_recall_values(ds, tags: list[str], min_len: int = 2) -> set[str]:
     for tag in tags:
         if tag not in ds:
             continue
-        raw = str(ds.get(tag, ''))
-        for token in tokens_from_dicom_value(raw):
-            if len(token) >= min_len:
-                values.add(token)
+        elem = ds.get(tag)
+        # multi-valued elements (e.g. OtherPatientIDs) must be iterated;
+        # str() of a MultiValue is "['A1', 'B2']", which matches nothing
+        items = list(elem) if isinstance(elem, (list, MultiValue)) else [elem]
+        for item in items:
+            for token in tokens_from_dicom_value(str(item) if item is not None else ''):
+                if len(token) >= min_len:
+                    values.add(token)
     return values
 
 
@@ -111,6 +119,97 @@ def build_recall_recognizer(ds, tags: list[str], min_len: int = 2):
         deny_list=sorted(values),
         deny_list_score=1.0,
     )
+
+
+def unsupported_reason(header) -> str | None:
+    """Return why this file cannot be redacted safely, or ``None``.
+
+    Checked from the header alone, *before* the engine runs, so unsupported
+    input is refused without ever touching the output directory.
+
+    - Multi-frame images: Presidio's engine only handles a single 2-D frame
+      and raises on anything else.
+    - Compressed transfer syntaxes: re-compression goes through GDCM, which
+      can abort the whole process (SIGABRT) on e.g. 16-bit RLE, killing the
+      rest of the batch and bypassing every ``except``.
+    """
+    if header is None:
+        return None
+    ts = getattr(getattr(header, 'file_meta', None), 'TransferSyntaxUID', None)
+    if ts is not None and ts.is_compressed:
+        return f'compressed transfer syntax ({ts.name}) is not supported'
+    try:
+        frames = int(header.get('NumberOfFrames', 1) or 1)
+    except (TypeError, ValueError):
+        frames = 1
+    if frames > 1:
+        return f'multi-frame image ({frames} frames) is not supported'
+    return None
+
+
+def looks_like_dicom(path: Path) -> bool:
+    """True if ``path`` has the DICOM Part-10 preamble ('DICM' at byte 128),
+    regardless of its file name."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read(132)[128:132] == b'DICM'
+    except OSError:
+        return False
+
+
+def publish(produced_dir: Path, dest_dir: Path) -> None:
+    """Move every file the engine produced into ``dest_dir``.
+
+    Each file is copied to a hidden temporary name and then renamed, so the
+    final name only ever appears with complete content.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for f in produced_dir.iterdir():
+        partial = dest_dir / f'.{f.name}.partial'
+        shutil.copyfile(f, partial)
+        os.replace(partial, dest_dir / f.name)
+
+
+def redact_one(engine, input_file: Path, dest_dir: Path, header,
+               options: Namespace, extra_kwargs: dict) -> None:
+    """Redact ``input_file`` into ``dest_dir``, fail-closed.
+
+    ``DicomImageRedactorEngine.redact_from_file`` copies its input into the
+    output directory *first* and redacts that copy in place, so an exception
+    midway would leave the unredacted original there. We therefore run the
+    engine in a throw-away directory and only publish its output after it
+    returned successfully. Any failure leaves ``dest_dir`` untouched.
+    """
+    with tempfile.TemporaryDirectory(prefix='dicom_pixel_redact_') as tmp:
+        src_dir, out_dir = Path(tmp) / 'src', Path(tmp) / 'out'
+        src_dir.mkdir()
+        out_dir.mkdir()
+        work = src_dir / input_file.name
+
+        if header is not None and 'IconImageSequence' in header:
+            # Presidio only redacts the top-level PixelData; a thumbnail
+            # would keep its burned-in text. Drop it from the working copy.
+            log.warning('%s: removing IconImageSequence (thumbnail is not redacted)',
+                        input_file.name)
+            ds = pydicom.dcmread(str(input_file))
+            del ds.IconImageSequence
+            ds.save_as(str(work))
+        else:
+            shutil.copyfile(input_file, work)
+
+        engine.redact_from_file(
+            str(work),
+            str(out_dir),
+            padding_width=options.padding_width,
+            fill=options.fill,
+            save_bboxes=options.save_bboxes,
+            ocr_kwargs={'ocr_threshold': options.ocr_threshold},
+            use_metadata=options.metadata_recall,
+            **extra_kwargs,
+        )
+        if not (out_dir / input_file.name).is_file():
+            raise RuntimeError('redaction engine produced no output file')
+        publish(out_dir, dest_dir)
 
 
 parser = ArgumentParser(
@@ -163,22 +262,25 @@ parser.add_argument(
     '--copy-others',
     action='store_true',
     default=False,
-    help='copy non-matching files from inputdir to outputdir unchanged',
+    help=(
+        'copy files that did not match --pattern from inputdir to outputdir '
+        'unchanged. Files that look like DICOM (preamble check) are never '
+        'copied, because they would be passed through un-redacted; they are '
+        'reported as failures instead'
+    ),
 )
 parser.add_argument(
-    '--metadata-recall', '--recall',
+    '--no-metadata-recall',
     dest='metadata_recall',
-    action=BooleanOptionalAction,
+    action='store_false',
     default=True,
     help=(
-        "for each file, also flag any burned-in text that exactly matches "
-        "that file's own PatientName/PatientID/etc. DICOM header values "
-        "(a per-file deny-list ad-hoc recognizer). This boosts recall for "
-        "identifiers Presidio's general NER model might not catch on its "
-        "own -- e.g. unusual name formats, MRNs, accession numbers -- since "
-        "we already know the ground-truth value from the header. Disable "
-        "with --no-metadata-recall if you don't trust the header to be "
-        "accurate yet (e.g. it hasn't been reconciled against the pixels)."
+        "by default, header values (PatientName, PatientID, ...) are used "
+        "to improve detection: (1) a per-file deny-list recognizer built "
+        "from --recall-tags, and (2) Presidio's own header-derived "
+        "deny-list. Pass this flag to turn BOTH off and rely only on "
+        "Presidio's general NER model, e.g. if the header can't be trusted "
+        "yet."
     ),
 )
 parser.add_argument(
@@ -212,8 +314,8 @@ parser.add_argument(
 @chris_plugin(
     parser=parser,
     title='A ChRIS plugin to detect and redact PHI embedded in DICOM pixel data',
-    category='',                 # ref. https://chrisstore.co/plugins
-    min_memory_limit='100Mi',    # supported units: Mi, Gi
+    category='DICOM De-identification',  # ref. https://chrisstore.co/plugins
+    min_memory_limit='2Gi',      # en_core_web_lg alone needs ~0.8 GB; supported units: Mi, Gi
     min_cpu_limit='1000m',       # millicores, e.g. "1000m" = 1 CPU core
     min_gpu_limit=0              # set min_gpu_limit=1 to enable GPU
 )
@@ -231,74 +333,69 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
     print(DISPLAY_TITLE)
     if options.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        # Presidio logs its recognizer-loading block at INFO/WARNING per file
+        for name in ('presidio-analyzer', 'presidio_analyzer', 'presidio_image_redactor'):
+            logging.getLogger(name).setLevel(logging.ERROR)
 
-    # Typically it's easier to think of programs as operating on individual files
-    # rather than directories. The helper functions provided by a ``PathMapper``
-    # object make it easy to discover input files and write to output files inside
-    # the given paths.
-    #
-    # Refer to the documentation for more options, examples, and advanced uses e.g.
-    # adding a progress bar and parallelism.
+    if not 1 <= options.padding_width <= 500:
+        parser.error('--padding-width must be between 1 and 500')
+    if not 0 <= options.ocr_threshold <= 100:
+        parser.error('--ocr-threshold must be between 0 and 100')
+
     engine = DicomImageRedactorEngine()
-    ocr_kwargs = {'ocr_threshold': options.ocr_threshold}
     recall_tags = [t.strip() for t in options.recall_tags.split(',') if t.strip()]
 
     mapper = PathMapper.file_mapper(
         inputdir, outputdir, glob=options.pattern, fail_if_empty=False
     )
+    files = list(mapper)
 
     n_ok = 0
     n_failed = 0
 
-    for input_file, output_file in mapper:
-        output_file.parent.mkdir(parents=True, exist_ok=True)
+    for input_file, output_file in files:
         log.info('Scrubbing %s', input_file.relative_to(inputdir))
 
+        try:
+            header = pydicom.dcmread(str(input_file), stop_before_pixels=True, force=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning('Could not read header of %s (%s)', input_file, e)
+            header = None
+
+        reason = unsupported_reason(header)
+        if reason:
+            log.error('Refusing %s: %s. It was NOT redacted and is not written to the output.',
+                      input_file, reason)
+            n_failed += 1
+            continue
+
         extra_kwargs = {}
-        if options.metadata_recall:
-            try:
-                header = pydicom.dcmread(str(input_file), stop_before_pixels=True, force=True)
-                recognizer = build_recall_recognizer(header, recall_tags, options.recall_min_len)
-            except Exception as e:
-                log.warning('Could not read header of %s for metadata recall '
-                            '(falling back to generic detection): %s', input_file, e)
-                recognizer = None
+        if options.metadata_recall and header is not None:
+            recognizer = build_recall_recognizer(header, recall_tags, options.recall_min_len)
             if recognizer is not None:
                 extra_kwargs['ad_hoc_recognizers'] = [recognizer]
 
         try:
-            # redact_from_file writes the scrubbed DICOM (and, if
-            # save_bboxes=True, a companion bounding-box JSON) into
-            # output_dir under the input file's own name.
-            engine.redact_from_file(
-                str(input_file),
-                str(output_file.parent),
-                padding_width=options.padding_width,
-                fill=options.fill,
-                save_bboxes=options.save_bboxes,
-                ocr_kwargs=ocr_kwargs,
-                **extra_kwargs,
-            )
-            produced = output_file.parent / input_file.name
-            if produced != output_file and produced.exists():
-                produced.rename(output_file)
+            redact_one(engine, input_file, output_file.parent, header, options, extra_kwargs)
             n_ok += 1
-        except Exception as e:  # noqa: BLE001 — one bad file shouldn't kill the run
+        except Exception as e:  # noqa: BLE001 -- one bad file shouldn't kill the run
             log.error('Failed to scrub %s: %s', input_file, e)
             n_failed += 1
 
     if options.copy_others:
-        import shutil
-        matched = {
-            p for p, _ in PathMapper.file_mapper(
-                inputdir, outputdir, glob=options.pattern, fail_if_empty=False
-            )
-        }
-        for src in inputdir.glob('**/*'):
-            if src.is_file() and src not in matched:
-                dst = outputdir / src.relative_to(inputdir)
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+        matched = {p for p, _ in files}
+        for src in sorted(inputdir.rglob('*')):
+            if not src.is_file() or src in matched:
+                continue
+            if looks_like_dicom(src):
+                log.error('Refusing to copy %s: it looks like DICOM but did not match '
+                          "--pattern '%s', so it was NOT redacted.", src, options.pattern)
+                n_failed += 1
+                continue
+            dst = outputdir / src.relative_to(inputdir)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
 
     log.info('Done. %d file(s) scrubbed, %d failed.', n_ok, n_failed)
     if n_ok == 0 and n_failed == 0:
@@ -307,8 +404,8 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
             "a different --pattern?", options.pattern, inputdir
         )
     if n_failed:
-        # Fail closed: a file we could not scrub is never written to the
-        # output, and the job must not look successful to downstream plugins.
+        # Fail closed: nothing un-redacted is written to the output (see
+        # redact_one), and the job must not look successful downstream.
         log.error('%d file(s) could NOT be redacted and were not written to %s.',
                   n_failed, outputdir)
         raise SystemExit(1)
