@@ -20,7 +20,7 @@ only sanitizes DICOM metadata.
 
 `pl-dicom_pixel_redact` finds and blacks out that text using
 [Microsoft Presidio](https://microsoft.github.io/presidio/)'s
-`DicomImageRedactorEngine`: Tesseract OCR reads text off each frame, spaCy's
+`DicomImageRedactorEngine`: Tesseract OCR reads text off the image, spaCy's
 NER model classifies it, and any span recognized as PHI gets redacted in
 place.
 
@@ -30,7 +30,7 @@ recall boost** from each DICOM's own header: since a file's `PatientName`,
 burned-in match against those values is flagged even when the general NER
 model wouldn't otherwise catch it (unusual name formats, MRNs, accession
 numbers, etc). This is on by default and can be tuned or disabled — see
-`--metadata-recall` below.
+`--no-metadata-recall` below.
 
 **Scope note:** this plugin only redacts *pixel* data. It does not modify
 PHI living in DICOM metadata tags (`PatientName`, `PatientID`, ...) — pair it
@@ -86,11 +86,13 @@ apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
 apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
     --fill background --save-bboxes incoming/ outgoing/
 
-# rely only on Presidio's general NER model, without the per-file header recall boost
+# rely only on Presidio's general NER model: turns off BOTH the per-file header
+# deny-list built by this plugin AND Presidio's own header-derived matching
 apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
     --no-metadata-recall incoming/ outgoing/
 
-# also copy through any non-DICOM files found in the input directory
+# also copy through non-DICOM files found in the input directory
+# (files that look like DICOM but did not match --pattern are refused, not copied)
 apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
     --copy-others incoming/ outgoing/
 ```
@@ -99,13 +101,46 @@ Run `dicom_pixel_redact --help` for the full list of options.
 
 ### Exit status and failures
 
-If any file cannot be redacted (corrupt DICOM, OCR error, ...), the plugin
-keeps processing the remaining files, **does not write the failed file to the
-output directory** (nothing un-redacted is ever passed through, including with
-`--copy-others`), and exits with status `1`. Check the log for
-`Failed to scrub ...` lines. If only the *header* cannot be read for
-`--metadata-recall`, the file is still redacted using Presidio's generic
-detection and a warning is logged.
+The plugin is **fail-closed**: a file that cannot be redacted is never written
+to the output directory. Presidio's engine copies its input into the output
+location first and redacts the copy in place, so the plugin runs it in a
+temporary directory and publishes the result only after it succeeded.
+
+If any file fails, the remaining files are still processed and the plugin
+exits with status `1`. Check the log for `Failed to scrub` and `Refusing`
+lines. A header that can't be read only disables `--recall-tags` matching for
+that file (a warning is logged); redaction still runs.
+
+### Limitations
+
+Read these before relying on the output for de-identification.
+
+- **Single-frame, uncompressed images only.** Multi-frame images (cine,
+  ultrasound loops) and compressed transfer syntaxes (RLE, JPEG, JPEG 2000...)
+  are refused up front, reported as failures and not written to the output.
+  Multi-frame is where burned-in PHI is most common, so for those inputs this
+  plugin currently does not help; they must be handled another way.
+  Compression is refused because re-compression through GDCM can abort the
+  whole process on some inputs.
+- **Files without pixel data** (e.g. structured reports) fail and are not
+  output.
+- **OCR is best-effort.** Not finding text is not proof an image is clean. On
+  small images (e.g. 256x256) Tesseract can miss lines entirely; the same text
+  on a larger image may be fully found. Spot-check output for each new scanner
+  or image type.
+- **Dates:** header recall uses stored values like `19700102`. Burned-in dates
+  are rarely written that way, so header matching will not catch a date of
+  birth; that relies on the NER model.
+- **Thumbnails:** only the top-level `PixelData` is redacted. If an
+  `IconImageSequence` (0088,0200) is present, the plugin removes it from the
+  output.
+- **File matching:** `--pattern` defaults to the case-sensitive `**/*.dcm`.
+  PACS exports named `IM0001`, `x.DCM` or `x.dicom` are not processed. Without
+  `--copy-others` they are ignored; with it they are refused and the run fails.
+  Use e.g. `--pattern '**/*'` to process everything.
+- **Header tags are not touched** (see the scope note above).
+- **Memory:** the spaCy `en_core_web_lg` model needs roughly 1 GB; the plugin
+  requests 2 GiB.
 
 ## Development
 
@@ -173,8 +208,9 @@ Tests are split into two groups:
   Tesseract; fast, and run in any environment.
 - `tests/test_integration.py` — runs the plugin end-to-end against synthetic
   DICOMs with burned-in PHI text, through the real Tesseract + spaCy +
-  Presidio pipeline, and checks the redacted pixels no longer OCR back to the
-  original name/ID. It skips itself (rather than failing) if `tesseract` or
+  Presidio pipeline. It first checks that OCR can read the text in the *input*
+  (positive control), then that the redacted pixels no longer OCR back to the
+  original name/ID, and that failing inputs leave nothing in the output. It skips itself (rather than failing) if `tesseract` or
   the `en_core_web_lg` spaCy model aren't available, so it degrades
   gracefully outside the `:dev` image.
 
