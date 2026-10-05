@@ -135,9 +135,7 @@ def unsupported_reason(header) -> str | None:
     """
     if header is None:
         return None
-    ts = getattr(getattr(header, 'file_meta', None), 'TransferSyntaxUID', None)
-    if ts is not None and ts.is_compressed:
-        return f'compressed transfer syntax ({ts.name}) is not supported'
+
     try:
         frames = int(header.get('NumberOfFrames', 1) or 1)
     except (TypeError, ValueError):
@@ -203,7 +201,7 @@ def redact_one(engine, input_file: Path, dest_dir: Path, header,
             padding_width=options.padding_width,
             fill=options.fill,
             save_bboxes=options.save_bboxes,
-            ocr_kwargs={'ocr_threshold': options.ocr_threshold},
+            ocr_kwargs={'ocr_threshold': options.ocr_threshold, 'config': f'--psm {options.ocr_psm}'},
             use_metadata=options.metadata_recall,
             **extra_kwargs,
         )
@@ -251,6 +249,18 @@ parser.add_argument(
     type=float,
     default=50.0,
     help='minimum OCR confidence (0-100) for a text region to be considered',
+)
+parser.add_argument(
+    '--ocr-psm',
+    type=int,
+    default=11,
+    choices=range(0, 14),
+    metavar='0-13',
+    help=(
+        'Tesseract page segmentation mode. '
+        'Mode 11 treats the image as sparse text and is generally better '
+        'suited to burned-in annotations scattered across medical images'
+    ),
 )
 parser.add_argument(
     '--save-bboxes',
