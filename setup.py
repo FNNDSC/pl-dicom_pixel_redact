@@ -24,9 +24,14 @@ setup(
     description='A ChRIS plugin to detect and redact PHI embedded in DICOM pixel data using Microsoft Presidio',
     author='FNNDSC',
     author_email='dev@babyMRI.org',
-    url='https://github.com/FNNDSC/pl-dicom_pixel_re',
+    url='https://github.com/FNNDSC/pl-dicom_pixel_redact',
     py_modules=['dicom_pixel_redact'],
-    install_requires=['chris_plugin'],
+    install_requires=[
+        'chris_plugin',
+        'presidio-image-redactor',
+        'presidio-analyzer',
+        'pydicom',
+    ],
     license='MIT',
     entry_points={
         'console_scripts': [
