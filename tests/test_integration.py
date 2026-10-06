@@ -248,6 +248,8 @@ class TestCompressedInput:
 
     @pytest.mark.parametrize('bits', [8, 16])
     def test_rle_compressed_is_redacted(self, tmp_path, bits):
+        if not app.gdcm_rle_encoder_works():
+            pytest.skip('GDCM RLE encoder unusable on this platform (e.g. linux/arm64)')
         import pydicom
         from pydicom.uid import RLELossless
         inputdir, outputdir = tmp_path / 'in', tmp_path / 'out'

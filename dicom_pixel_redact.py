@@ -11,9 +11,12 @@ live in DICOM metadata tags (PatientName, PatientID, etc.) — pair it with a
 tag-scrubbing plugin (e.g. pl-pfdicom_anonymize, or pydicom-based tag removal)
 for full de-identification.
 """
+import functools
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from argparse import ArgumentParser, Namespace, ArgumentDefaultsHelpFormatter
@@ -121,6 +124,46 @@ def build_recall_recognizer(ds, tags: list[str], min_len: int = 2):
     )
 
 
+# Run in a throw-away interpreter: on some platforms GDCM's RLE encoder raises
+# an uncaught C++ exception, which aborts the whole process (SIGABRT) and
+# bypasses every ``except``. Presidio re-encodes compressed input with exactly
+# this call, so we try it on a tiny image first.
+_GDCM_RLE_PROBE = """
+import numpy as np
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import (ExplicitVRLittleEndian, RLELossless,
+                         SecondaryCaptureImageStorage, generate_uid)
+meta = FileMetaDataset()
+meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+meta.MediaStorageSOPInstanceUID = generate_uid()
+meta.TransferSyntaxUID = ExplicitVRLittleEndian
+ds = FileDataset('probe', {}, file_meta=meta, preamble=b'\\0' * 128)
+ds.SOPClassUID = SecondaryCaptureImageStorage
+ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+ds.Rows = ds.Columns = 64
+ds.SamplesPerPixel = 1
+ds.PhotometricInterpretation = 'MONOCHROME2'
+ds.BitsAllocated, ds.BitsStored, ds.HighBit, ds.PixelRepresentation = 16, 16, 15, 0
+ds.PixelData = (np.arange(64 * 64, dtype=np.uint16) % 251).tobytes()
+ds.is_little_endian, ds.is_implicit_VR = True, False
+ds.compress(RLELossless, encoding_plugin='gdcm')
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def gdcm_rle_encoder_works() -> bool:
+    """True if GDCM can RLE-encode on this machine (checked once per run)."""
+    try:
+        proc = subprocess.run([sys.executable, '-c', _GDCM_RLE_PROBE],
+                              capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning('GDCM RLE probe could not run: %s', e)
+        return False
+    if proc.returncode != 0:
+        log.warning('GDCM RLE probe failed with exit status %s', proc.returncode)
+    return proc.returncode == 0
+
+
 def unsupported_reason(header) -> str | None:
     """Return why this file cannot be redacted safely, or ``None``.
 
@@ -130,12 +173,21 @@ def unsupported_reason(header) -> str | None:
     - Multi-frame images: Presidio's engine only handles a single 2-D frame
       and raises on anything else.
 
-    Compressed transfer syntaxes are passed to Presidio for decompression,
-    redaction and, when ng. Native GDCM recompression can
-    abort the process on some inputs (notably 16-bit RLE on linux/arm64).
+    - Compressed input, but only where GDCM cannot RLE-encode. All input in
+      ChRIS is compressed, so compressed files are normally passed to Presidio,
+      which decompresses, redacts and re-encodes them as RLE Lossless. That
+      native encoder aborts the whole process on some platforms (observed on
+      linux/arm64 builds), so a one-off probe (:func:`gdcm_rle_encoder_works`)
+      decides. Uncompressed files never trigger the probe.
     """
     if header is None:
         return None
+
+    ts = getattr(getattr(header, 'file_meta', None), 'TransferSyntaxUID', None)
+    if ts is not None and ts.is_compressed and not gdcm_rle_encoder_works():
+        return (f'compressed input ({ts.name}) cannot be handled on this platform: '
+                'the GDCM RLE encoder Presidio uses to re-encode it fails here '
+                '(observed on linux/arm64 builds)')
 
     try:
         frames = int(header.get('NumberOfFrames', 1) or 1)
@@ -255,12 +307,14 @@ parser.add_argument(
     '--ocr-psm',
     type=int,
     default=11,
-    choices=range(0, 14),
-    metavar='0-13',
+    choices=(11, 12, 13),
     help=(
-        'Tesseract page segmentation mode. '
-        'Mode 11 treats the image as sparse text and is generally better '
-        'suited to burned-in annotations scattered across medical images'
+        'Tesseract page segmentation mode. 11: sparse text, find as much '
+        'text as possible in no particular order (recommended for burned-in '
+        'annotations scattered across an image); 12: sparse text with '
+        'orientation detection; 13: raw line, treat the whole image as one '
+        'text line. Modes are restricted to 11-13 for this workflow; this is '
+        'not a guarantee of complete PHI detection.'
     ),
 )
 parser.add_argument(

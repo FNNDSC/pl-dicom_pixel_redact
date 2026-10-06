@@ -39,8 +39,12 @@ Watch-list:
 
 - **pydicom** is pinned to 2.4.5; pydicom 3.x is not yet validated with this plugin.
 - **python-gdcm** is native code used by Presidio to re-encode compressed
-  pixel data as RLE Lossless. Upgrade it deliberately and re-run the compressed
-  integration tests.
+  pixel data as RLE Lossless. Its RLE encoder aborts on `linux/arm64` builds
+  (reported with python-gdcm 3.0.24, 3.2.1 and 3.2.6), which is why the plugin
+  probes it at run time (`gdcm_rle_encoder_works`). Upgrade it deliberately and
+  re-run the compressed integration tests. `ci.yml` publishes only
+  `linux/amd64`; if you enable `linux/arm64`, expect compressed input to be
+  refused on that image until the encoder is fixed.
 - **spaCy model** is pinned by wheel URL in the `Dockerfile`. If spaCy is
   upgraded, confirm the model version is still compatible and update both the
   Dockerfile and this file.
