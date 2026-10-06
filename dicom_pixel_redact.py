@@ -129,9 +129,10 @@ def unsupported_reason(header) -> str | None:
 
     - Multi-frame images: Presidio's engine only handles a single 2-D frame
       and raises on anything else.
-    - Compressed transfer syntaxes: re-compression goes through GDCM, which
-      can abort the whole process (SIGABRT) on e.g. 16-bit RLE, killing the
-      rest of the batch and bypassing every ``except``.
+
+    Compressed transfer syntaxes are passed to Presidio for decompression,
+    redaction and, when detected as compressed, RLE Lossless re-encoding. Native GDCM recompression can
+    abort the process on some inputs (notably 16-bit RLE on linux/arm64).
     """
     if header is None:
         return None
@@ -254,12 +255,14 @@ parser.add_argument(
     '--ocr-psm',
     type=int,
     default=11,
-    choices=range(0, 14),
-    metavar='0-13',
+    choices=(11, 12, 13),
     help=(
-        'Tesseract page segmentation mode. '
-        'Mode 11 treats the image as sparse text and is generally better '
-        'suited to burned-in annotations scattered across medical images'
+        'Tesseract page segmentation mode. 11: sparse text, find as much '
+        'text as possible in no particular order (recommended for burned-in '
+        'annotations scattered across an image); 12: sparse text with '
+        'orientation detection; 13: raw line, treat the whole image as one '
+        'text line. Modes are restricted to 11-13 for this workflow; this is '
+        'not a guarantee of complete PHI detection.'
     ),
 )
 parser.add_argument(

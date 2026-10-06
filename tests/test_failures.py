@@ -172,7 +172,7 @@ class TestFailClosed:
 
 
 class TestUnsupportedInput:
-    """Refused up front: the engine is never called, nothing is written."""
+    """Multi-frame input is refused; compression alone is not refused."""
 
     def test_multi_frame_is_refused(self, dirs, caplog):
         i, o = dirs
@@ -189,6 +189,14 @@ class TestUnsupportedInput:
         write_dcm(i / 'a.dcm', frames=1)
         run(i, o)
         assert tree(o) == ['a.dcm']
+
+    def test_compressed_transfer_syntax_is_accepted(self, dirs):
+        # Header-only fixture tests routing to the fake engine, not codec support.
+        i, o = dirs
+        write_dcm(i / 'rle.dcm', transfer_syntax=RLELossless)
+        run(i, o)
+        assert len(FakeEngine.calls) == 1
+        assert tree(o) == ['rle.dcm']
 
     def test_unsupported_file_does_not_block_supported_ones(self, dirs):
         i, o = dirs
@@ -310,11 +318,11 @@ class TestMetadataRecall:
         i, o = dirs
         write_dcm(i / 'a.dcm')
         run(i, o, '--fill', 'background', '--padding-width', '7',
-            '--ocr-threshold', '80', '--save-bboxes')
+            '--ocr-threshold', '80', '--ocr-psm', '12', '--save-bboxes')
         kw = FakeEngine.calls[0]
         assert kw['fill'] == 'background'
         assert kw['padding_width'] == 7
-        assert kw['ocr_kwargs'] == {'ocr_threshold': 80.0, 'config': '--psm 11'}
+        assert kw['ocr_kwargs'] == {'ocr_threshold': 80.0, 'config': '--psm 12'}
         assert kw['save_bboxes'] is True
 
 

@@ -68,6 +68,28 @@ class TestChrisDescriptor:
         assert by_flag['--no-metadata-recall']['action'] == 'store_false'
 
 
+class TestOcrPsm:
+
+    def test_default_is_11(self):
+        assert parse([]).ocr_psm == 11
+
+    @pytest.mark.parametrize('mode', [11, 12, 13])
+    def test_allowed_modes(self, mode):
+        assert parse(['--ocr-psm', str(mode)]).ocr_psm == mode
+
+    @pytest.mark.parametrize('mode', [*range(11), 14, -1])
+    def test_modes_below_11_or_out_of_range_are_rejected(self, mode):
+        # e.g. 0 (orientation only) and 2 (no OCR) return no text, which would
+        # leave the image un-redacted while the run still exits 0
+        with pytest.raises(SystemExit):
+            parse(['--ocr-psm', str(mode)])
+
+    def test_serializes_for_chris(self):
+        from chris_plugin.parameters import serialize
+        by_flag = {spec['flag']: spec for spec in serialize(app.parser)}
+        assert by_flag['--ocr-psm']['default'] == 11
+
+
 class TestOtherFlags:
 
     def test_fill_rejects_invalid_choice(self):
