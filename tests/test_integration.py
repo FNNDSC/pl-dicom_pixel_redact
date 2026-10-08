@@ -17,6 +17,7 @@ Run explicitly with:  pytest tests/test_integration.py -v
 """
 import shutil
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,8 @@ def make_synthetic_dicom(
     patient_id: str,
     burned_text: str,
     with_pixel_data: bool = True,
+    bits: int = 8,
+    compress: bool = False,
 ) -> None:
     """Write a small single-frame DICOM whose pixel data has `burned_text`
     rendered onto it as white text on a dark background -- a stand-in for a
@@ -70,6 +73,8 @@ def make_synthetic_dicom(
         font = ImageFont.load_default()
     ImageDraw.Draw(img).text((10, 10), burned_text, fill=255, font=font)
     arr = np.array(img)
+    if bits == 16:
+        arr = arr.astype(np.uint16) * 256
 
     meta = FileMetaDataset()
     meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
@@ -87,14 +92,17 @@ def make_synthetic_dicom(
     ds.Rows, ds.Columns = arr.shape
     ds.SamplesPerPixel = 1
     ds.PhotometricInterpretation = 'MONOCHROME2'
-    ds.BitsAllocated = 8
-    ds.BitsStored = 8
-    ds.HighBit = 7
+    ds.BitsAllocated = bits
+    ds.BitsStored = bits
+    ds.HighBit = bits - 1
     ds.PixelRepresentation = 0
     if with_pixel_data:
         ds.PixelData = arr.tobytes()
     ds.is_little_endian = True
     ds.is_implicit_VR = False
+    if compress:
+        from pydicom.uid import RLELossless
+        ds.compress(RLELossless)
     ds.save_as(str(path), write_like_original=False)
 
 
@@ -108,9 +116,13 @@ def run_plugin(inputdir: Path, outputdir: Path, extra_args=None):
 
 
 def ocr_text(dataset) -> str:
+    import numpy as np
     import pytesseract
     from PIL import Image
-    return pytesseract.image_to_string(Image.fromarray(dataset.pixel_array)).upper()
+    arr = dataset.pixel_array
+    if arr.dtype != np.uint8:      # 16-bit: scale to 8-bit for Tesseract
+        arr = (arr / 256).astype(np.uint8)
+    return pytesseract.image_to_string(Image.fromarray(arr)).upper()
 
 
 class TestPixelRedaction:
@@ -229,6 +241,49 @@ class TestPixelRedaction:
         # should log a warning and exit cleanly, not raise
         run_plugin(inputdir, outputdir)
         assert list(outputdir.iterdir()) == []
+
+
+class TestCompressedInput:
+    """Exercise real RLE codecs in a child process to contain native aborts."""
+
+    @pytest.mark.parametrize('bits', [8, 16])
+    def test_rle_compressed_is_redacted(self, tmp_path, bits):
+        if not app.gdcm_rle_encoder_works():
+            pytest.skip('GDCM RLE encoder unusable on this platform (e.g. linux/arm64)')
+        import pydicom
+        from pydicom.uid import RLELossless
+        inputdir, outputdir = tmp_path / 'in', tmp_path / 'out'
+        outputdir.mkdir()
+        src = inputdir / 'rle.dcm'
+        make_synthetic_dicom(src, 'DOE^JANE^Q', 'MRN99887',
+                             'PATIENT: JANE DOE   ID: MRN99887',
+                             bits=bits, compress=True)
+        original = pydicom.dcmread(str(src))
+        assert original.file_meta.TransferSyntaxUID == RLELossless
+        before = ocr_text(original)
+        assert all(token in before for token in ('JANE', 'DOE', 'MRN99887'))
+        original_pixels = original.pixel_array.copy()
+        original_bytes = src.read_bytes()
+
+        # GDCM may SIGABRT on 16-bit RLE, especially on ARM64. A child process
+        # turns an abort into a test failure without terminating all of pytest.
+        result = subprocess.run(
+            [sys.executable, str(Path(app.__file__).resolve()),
+             str(inputdir), str(outputdir)],
+            capture_output=True, text=True, timeout=180,
+        )
+        assert result.returncode == 0, (
+            f'redaction exited {result.returncode}: {result.stderr}'
+        )
+
+        redacted = pydicom.dcmread(str(outputdir / 'rle.dcm'))
+        text = ocr_text(redacted)
+        assert all(token not in text for token in ('JANE', 'DOE', 'MRN99887'))
+        assert redacted.file_meta.TransferSyntaxUID == RLELossless
+        assert redacted.pixel_array.shape == original_pixels.shape
+        assert redacted.BitsAllocated == bits
+        assert (redacted.pixel_array != original_pixels).any()
+        assert src.read_bytes() == original_bytes
 
 
 class TestRealEngineFailClosed:

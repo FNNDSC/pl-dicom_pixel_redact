@@ -8,6 +8,7 @@ the real output directory to the engine. These tests run without Tesseract or
 spaCy and exercise only the plugin's own control flow.
 """
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -172,7 +173,7 @@ class TestFailClosed:
 
 
 class TestUnsupportedInput:
-    """Refused up front: the engine is never called, nothing is written."""
+    """Multi-frame input is refused; compression alone is not refused."""
 
     def test_multi_frame_is_refused(self, dirs, caplog):
         i, o = dirs
@@ -190,14 +191,43 @@ class TestUnsupportedInput:
         run(i, o)
         assert tree(o) == ['a.dcm']
 
-    def test_compressed_transfer_syntax_is_refused(self, dirs, caplog):
+    def test_compressed_transfer_syntax_is_accepted_when_gdcm_works(self, dirs, monkeypatch):
+        # Header-only fixture tests routing to the fake engine, not codec support.
+        monkeypatch.setattr(app, 'gdcm_rle_encoder_works', lambda: True)
         i, o = dirs
         write_dcm(i / 'rle.dcm', transfer_syntax=RLELossless)
+        run(i, o)
+        assert len(FakeEngine.calls) == 1
+        assert tree(o) == ['rle.dcm']
+
+    def test_compressed_is_refused_when_gdcm_encoder_fails(self, dirs, monkeypatch, caplog):
+        # e.g. linux/arm64: the encoder would SIGABRT the whole run
+        monkeypatch.setattr(app, 'gdcm_rle_encoder_works', lambda: False)
+        i, o = dirs
+        write_dcm(i / 'rle.dcm', transfer_syntax=RLELossless)
+        with pytest.raises(SystemExit) as exc:
+            run(i, o)
+        assert exc.value.code == 1
+        assert FakeEngine.calls == [] and tree(o) == []
+        assert 'linux/arm64' in caplog.text
+
+    def test_uncompressed_files_are_processed_when_gdcm_fails(self, dirs, monkeypatch):
+        monkeypatch.setattr(app, 'gdcm_rle_encoder_works', lambda: False)
+        i, o = dirs
+        write_dcm(i / 'rle.dcm', transfer_syntax=RLELossless)
+        write_dcm(i / 'raw.dcm')
         with pytest.raises(SystemExit):
             run(i, o)
-        assert FakeEngine.calls == []
-        assert tree(o) == []
-        assert 'compressed' in caplog.text
+        assert tree(o) == ['raw.dcm']
+
+    def test_probe_is_not_run_for_uncompressed_input(self, dirs, monkeypatch):
+        def boom():
+            raise AssertionError('probe must not run for uncompressed input')
+        monkeypatch.setattr(app, 'gdcm_rle_encoder_works', boom)
+        i, o = dirs
+        write_dcm(i / 'raw.dcm')
+        run(i, o)
+        assert tree(o) == ['raw.dcm']
 
     def test_unsupported_file_does_not_block_supported_ones(self, dirs):
         i, o = dirs
@@ -206,6 +236,47 @@ class TestUnsupportedInput:
         with pytest.raises(SystemExit):
             run(i, o)
         assert tree(o) == ['ok.dcm']
+
+
+class TestGdcmProbe:
+    """The probe must turn a native abort into a plain False."""
+
+    @pytest.fixture(autouse=True)
+    def fresh_cache(self):
+        app.gdcm_rle_encoder_works.cache_clear()
+        yield
+        app.gdcm_rle_encoder_works.cache_clear()
+
+    @staticmethod
+    def fake_run(returncode=0, exc=None):
+        def run(cmd, **kw):
+            if exc:
+                raise exc
+            return subprocess.CompletedProcess(cmd, returncode, b'', b'')
+        return run
+
+    def test_success(self, monkeypatch):
+        monkeypatch.setattr(app.subprocess, 'run', self.fake_run(0))
+        assert app.gdcm_rle_encoder_works() is True
+
+    @pytest.mark.parametrize('rc', [1, 134, -6])      # error, 128+SIGABRT, killed by SIGABRT
+    def test_abort_or_error_means_unusable(self, monkeypatch, rc):
+        monkeypatch.setattr(app.subprocess, 'run', self.fake_run(rc))
+        assert app.gdcm_rle_encoder_works() is False
+
+    def test_timeout_means_unusable(self, monkeypatch):
+        monkeypatch.setattr(app.subprocess, 'run', self.fake_run(
+            exc=subprocess.TimeoutExpired('x', 1)))
+        assert app.gdcm_rle_encoder_works() is False
+
+    def test_result_is_cached(self, monkeypatch):
+        calls = []
+        def run(cmd, **kw):
+            calls.append(1)
+            return subprocess.CompletedProcess(cmd, 0, b'', b'')
+        monkeypatch.setattr(app.subprocess, 'run', run)
+        app.gdcm_rle_encoder_works(); app.gdcm_rle_encoder_works()
+        assert len(calls) == 1
 
 
 class TestIconImage:
@@ -319,11 +390,11 @@ class TestMetadataRecall:
         i, o = dirs
         write_dcm(i / 'a.dcm')
         run(i, o, '--fill', 'background', '--padding-width', '7',
-            '--ocr-threshold', '80', '--save-bboxes')
+            '--ocr-threshold', '80', '--ocr-psm', '12', '--save-bboxes')
         kw = FakeEngine.calls[0]
         assert kw['fill'] == 'background'
         assert kw['padding_width'] == 7
-        assert kw['ocr_kwargs'] == {'ocr_threshold': 80.0}
+        assert kw['ocr_kwargs'] == {'ocr_threshold': 80.0, 'config': '--psm 12'}
         assert kw['save_bboxes'] is True
 
 

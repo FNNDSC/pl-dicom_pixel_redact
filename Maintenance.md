@@ -8,19 +8,20 @@ development are in [README.md](README.md).
 
 | File | Role |
 |---|---|
-| `requirements.txt` | Runtime dependencies, installed in the Docker image with `pip install -r`. Compatible-release ranges (`~=`), **not** a full lock. |
+| `requirements.txt` | Runtime dependencies, installed in the Docker image with `pip install -r`. Direct dependencies are pinned exactly; transitive ones are not (no hashes), so it is **not** a full lock. |
 | `setup.py` | `install_requires` lists the runtime packages (unpinned); extras `dev` adds `pytest`. |
 | `Dockerfile` | Also installs the `en_core_web_lg` 3.8.0 spaCy model and the `tesseract-ocr` apt package. |
 
-`chris_plugin` and `presidio-image-redactor` are pinned exactly (0.0.x
-releases of the latter have changed behaviour). The rest use compatible-release
-ranges, so two builds on different days can resolve different transitive
-versions. Treat every rebuild as a dependency change: run the full test suite
-(below) before releasing.
+The five direct dependencies are pinned to exact versions
+(`chris_plugin`, `presidio-analyzer`, `presidio-image-redactor`, `pydicom`,
+`Pillow`). Their transitive dependencies (spaCy, python-gdcm, numpy, ...) are
+still resolved at build time, so two builds on different days can differ.
+Treat every rebuild as a dependency change: run the full test suite (below)
+before releasing.
 
 ### Upgrading dependencies
 
-1. Edit the range in `requirements.txt`.
+1. Change the pin in `requirements.txt`.
 2. Build the dev image and run all tests, including the integration tests
    that need Tesseract and spaCy (they skip outside the image, so a green run
    on a bare machine proves little):
@@ -36,10 +37,14 @@ versions. Treat every rebuild as a dependency change: run the full test suite
 
 Watch-list:
 
-- **pydicom** is `~=2.4`; pydicom 3.x is not yet validated with this plugin.
-- **cryptography** is not used directly. It arrives via presidio's optional
-  Azure OCR backend, which this plugin never calls (it uses Tesseract). Scans
-  may still flag it; see Vulnerability scanning.
+- **pydicom** is pinned to 2.4.5; pydicom 3.x is not yet validated with this plugin.
+- **python-gdcm** is native code used by Presidio to re-encode compressed
+  pixel data as RLE Lossless. Its RLE encoder aborts on `linux/arm64` builds
+  (reported with python-gdcm 3.0.24, 3.2.1 and 3.2.6), which is why the plugin
+  probes it at run time (`gdcm_rle_encoder_works`). Upgrade it deliberately and
+  re-run the compressed integration tests. `ci.yml` publishes only
+  `linux/amd64`; if you enable `linux/arm64`, expect compressed input to be
+  refused on that image until the encoder is fixed.
 - **spaCy model** is pinned by wheel URL in the `Dockerfile`. If spaCy is
   upgraded, confirm the model version is still compatible and update both the
   Dockerfile and this file.
@@ -53,7 +58,7 @@ pip-audit -r requirements.txt
 
 Run after any dependency change and roughly monthly. For each finding:
 check for a fixed version; if the package is a direct dependency bump its
-range in `requirements.txt`; if it is transitive, add an explicit line for it
+pin in `requirements.txt`; if it is transitive, add an explicit line for it
 with a comment saying why; then rebuild, retest, re-scan, regenerate the SBOM.
 
 ## SBOM
@@ -74,12 +79,14 @@ Better still, produce it in CI on every tag, for example with
 `sbom: true` on `docker/build-push-action` or a `syft`/`trivy` step on the
 pushed tag, and attach it to the release.
 
-**Known problem:** the `sbom.cdx.json` currently checked in was produced by
-`cyclonedx-py environment` in a separate venv. It records a local
-`file:///home/claude/...` source path, lists 11 Python packages whose versions
-differ from the image (e.g. `pydicom 3.0.2` vs 2.4.x installed,
-`cryptography 50.0.1` vs 48.0.1) and has no OS packages. Treat it as
-inaccurate. Regenerate it as above, or delete it, before relying on it.
+**Current file:** `sbom.cdx.json` contains the Python dependency snapshot
+supplied with this patch: 76 package components, exact direct dependency
+versions matching `requirements.txt`, no local source paths, and the plugin
+as the application component. Its generation environment and correspondence
+to a shipped image have not been independently verified. It omits OS packages
+such as `tesseract-ocr` and `libgl1` and is not a complete image SBOM.
+Regenerate it from the actual release image using `syft` as above before
+relying on it for vulnerability or deployment decisions.
 
 ## Testing
 
@@ -87,8 +94,8 @@ inaccurate. Regenerate it as above, or delete it, before relying on it.
 |---|---|---|
 | `tests/test_cli.py` | nothing | argument parsing and defaults |
 | `tests/test_recall.py` | nothing | header-derived deny-list logic |
-| `tests/test_failures.py` | nothing (engine is faked) | fail-closed output, unsupported input (multi-frame, compressed), exit codes, `--copy-others` refusals, option validation, recall wiring |
-| `tests/test_integration.py` | Tesseract, `en_core_web_lg` | real OCR → redaction on synthetic DICOMs, and real-engine failure cases |
+| `tests/test_failures.py` | nothing (engine is faked) | fail-closed output, unsupported input (multi-frame), compressed input accepted, exit codes, `--copy-others` refusals, option validation, recall wiring |
+| `tests/test_integration.py` | Tesseract, `en_core_web_lg` | real OCR → redaction on synthetic DICOMs (incl. RLE-compressed 8/16-bit), and real-engine failure cases |
 
 The fake engine in `test_failures.py` deliberately copies the input into its
 output directory *before* failing, like Presidio does. Keep it that way: a
@@ -121,8 +128,9 @@ Manual fallback steps are in [README.md > Release](README.md#release).
 
 ## Scope reminder
 
-See README > Limitations for what the plugin does not handle (multi-frame and
-compressed images are refused; OCR is best-effort). The plugin redacts
+See README > Limitations: multi-frame images are refused; compressed input
+is re-encoded as RLE Lossless, with native codec crash risks (including the
+reported 16-bit RLE SIGABRT on linux/arm64); OCR is best-effort. The plugin redacts
 **pixel** data only. DICOM header tags are left intact by
 design; pair with a tag-scrubbing plugin for full de-identification. OCR-based
 detection is best-effort: absence of a detection is not proof that an image is
@@ -133,7 +141,9 @@ PHI-free, so spot-check output on new scanner types.
 - Move to a hash-locked `requirements.txt` (pip-tools) and install with
   `--require-hashes` in the Dockerfile.
 - Scheduled CI job running `pip-audit`.
-- Multi-frame support (redact frame by frame) and a per-file subprocess so
-  that a native crash in a codec cannot take down the whole batch.
+- Multi-frame support (redact frame by frame).
+- Run each file in a subprocess so a native crash in a codec (GDCM) cannot
+  take down the whole batch; also verify codecs other than RLE (JPEG, JPEG 2000,
+  JPEG-LS) in the integration tests.
 - Add `examples/incoming` / `examples/outgoing` so CI's "Run examples" step
   actually runs.

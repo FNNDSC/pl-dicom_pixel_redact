@@ -81,6 +81,10 @@ A few common variations:
 apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
     --pattern '**/*.dicom' incoming/ outgoing/
 
+# choose the Tesseract page segmentation mode (11 = sparse text, the default)
+apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
+    --ocr-psm 12 incoming/ outgoing/
+
 # fill redacted regions by sampling the background instead of high-contrast black/white,
 # and save the redacted bounding boxes as JSON next to each output file
 apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
@@ -115,13 +119,36 @@ that file (a warning is logged); redaction still runs.
 
 Read these before relying on the output for de-identification.
 
-- **Single-frame, uncompressed images only.** Multi-frame images (cine,
-  ultrasound loops) and compressed transfer syntaxes (RLE, JPEG, JPEG 2000...)
+- **Single-frame images only.** Multi-frame images (cine, ultrasound loops)
   are refused up front, reported as failures and not written to the output.
   Multi-frame is where burned-in PHI is most common, so for those inputs this
   plugin currently does not help; they must be handled another way.
-  Compression is refused because re-compression through GDCM can abort the
-  whole process on some inputs.
+- **Compressed input is passed to Presidio.**
+  Presidio decodes the pixels and uses GDCM to re-encode input it recognizes
+  as compressed as RLE Lossless, regardless of the original codec. In the
+  pinned version, compression detection compares the pixel payload length
+  with the expected uncompressed size, rather than checking the transfer
+  syntax; unusual or poorly compressible images need separate validation.
+  The output transfer syntax can therefore differ from the input (e.g. JPEG 2000 in, RLE
+  out) and the file may be larger. RLE input (8-bit and 16-bit) is covered by
+  the integration tests; other codecs are not. Recompression runs in native
+  code, so a codec-specific crash would stop the whole batch rather than one
+  file. A 256×256, 16-bit MONOCHROME2 MR image with RLE Lossless has caused
+  SIGABRT during recompression on Apple Silicon (`linux/arm64`), while the
+  same reproduction did not abort on `linux/amd64`. These tests do not
+  establish safety for every image or architecture. Pre-check representative
+  inputs on the target architecture; per-file subprocess isolation remains a
+  follow-up. Temporary output is published only after successful redaction,
+  but a native abort can leave working files in the system temporary directory.
+- **Compressed input is refused where GDCM's RLE encoder is broken.** The
+  abort above is a property of the platform's GDCM build, not of the image
+  (observed on `linux/arm64` builds; the published `linux/amd64` image is not
+  affected). The first time the plugin meets a compressed file it tries a tiny
+  RLE encode in a separate process. If that fails, compressed files are
+  refused up front (exit status 1, nothing written for them, a message naming
+  the platform problem) while uncompressed files are still processed. The
+  probe covers the known encoder failure only; it does not replace the
+  per-file isolation follow-up.
 - **Files without pixel data** (e.g. structured reports) fail and are not
   output.
 - **OCR is best-effort.** Not finding text is not proof an image is clean. On
