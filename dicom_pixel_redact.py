@@ -36,7 +36,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-__version__ = '1.0.0'
+__version__ = '1.0.1'
 
 # DICOM keywords whose values are, by definition, this study's own ground-truth
 # PHI. We use them as a deny-list ad-hoc recognizer per file: if burned-in
