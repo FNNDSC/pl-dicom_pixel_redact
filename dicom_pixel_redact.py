@@ -20,6 +20,8 @@ import sys
 import tempfile
 from pathlib import Path
 from argparse import ArgumentParser, Namespace, ArgumentDefaultsHelpFormatter
+from types import SimpleNamespace
+from sequence_redaction import propagate_staged_files
 import pydicom
 from pydicom.multival import MultiValue
 from presidio_image_redactor import DicomImageRedactorEngine
@@ -324,6 +326,14 @@ parser.add_argument(
     help='write a JSON file of redacted bounding boxes next to each output DICOM',
 )
 parser.add_argument(
+    '--propagate-bboxes',
+    action='store_true',
+    default=False,
+    help='Treat each input subdirectory as one aligned 2D frame sequence; '
+         'propagate the union of detected redaction regions across every frame. '
+         'Compressed input allowed; outputs are uncompressed. No detected boxes fails.',
+)
+parser.add_argument(
     '--copy-others',
     action='store_true',
     default=False,
@@ -419,7 +429,59 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
     n_ok = 0
     n_failed = 0
 
-    for input_file, output_file in files:
+    if options.propagate_bboxes:
+        # Explicit opt-in: each input parent directory must contain ONE aligned
+        # sequence. Do not group by patient or SeriesInstanceUID implicitly.
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for src, dst in files:
+            groups[src.parent].append((src, dst))
+        for members in groups.values():
+            try:
+                with tempfile.TemporaryDirectory(prefix='dicom_sequence_') as tmp:
+                    stage = Path(tmp)
+                    # Presidio sidecars use DICOM stem names: reject collisions.
+                    if len({src.stem for src, _ in members}) != len(members):
+                        raise ValueError('duplicate DICOM stems in sequence')
+                    staged_files = []
+                    for src, dst in members:
+                        header = pydicom.dcmread(str(src), stop_before_pixels=True)
+                        reason = unsupported_reason(header)
+                        if reason:
+                            raise ValueError(reason)
+                        extra = {}
+                        if options.metadata_recall:
+                            recognizer = build_recall_recognizer(
+                                header, recall_tags, options.recall_min_len)
+                            if recognizer is not None:
+                                extra['ad_hoc_recognizers'] = [recognizer]
+                        # Force private bounding boxes only in staging.
+                        staged_options = SimpleNamespace(**vars(options))
+                        staged_options.save_bboxes = True
+                        redact_one(engine, src, stage, header, staged_options, extra)
+                        staged_files.append(stage / src.name)
+                    propagate_staged_files(staged_files)
+                    # All frame-level processing and validation completed.
+                    # Final output is native Explicit VR Little Endian, even
+                    # when Presidio's original input/output was compressed.
+                    for src, dst in members:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        produced = stage / src.name
+                        temporary = dst.with_name('.' + dst.name + '.partial')
+                        shutil.copyfile(produced, temporary)
+                        os.replace(temporary, dst)
+                        if options.save_bboxes:
+                            sidecar = produced.with_suffix('.json')
+                            shutil.copyfile(sidecar, dst.with_suffix('.json'))
+                n_ok += len(members)
+            except Exception as e:  # noqa: BLE001
+                log.error('Failed to scrub aligned frame sequence: %s', e)
+                n_failed += len(members)
+        files_to_process = []
+    else:
+        files_to_process = files
+
+    for input_file, output_file in files_to_process:
         log.info('Scrubbing %s', input_file.relative_to(inputdir))
 
         try:
