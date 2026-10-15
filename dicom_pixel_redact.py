@@ -12,6 +12,7 @@ tag-scrubbing plugin (e.g. pl-pfdicom_anonymize, or pydicom-based tag removal)
 for full de-identification.
 """
 import functools
+import json
 import logging
 import os
 import shutil
@@ -21,7 +22,8 @@ import tempfile
 from pathlib import Path
 from argparse import ArgumentParser, Namespace, ArgumentDefaultsHelpFormatter
 from types import SimpleNamespace
-from sequence_redaction import propagate_staged_files
+from sequence_redaction import propagate_staged_files, entities_path
+from header_match import HeaderMatcher, header_values, validate_keywords
 import pydicom
 from pydicom.multival import MultiValue
 from presidio_image_redactor import DicomImageRedactorEngine
@@ -36,7 +38,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-__version__ = '1.0.1'
+__version__ = '1.0.2'
 
 # DICOM keywords whose values are, by definition, this study's own ground-truth
 # PHI. We use them as a deny-list ad-hoc recognizer per file: if burned-in
@@ -223,6 +225,33 @@ def publish(produced_dir: Path, dest_dir: Path) -> None:
         os.replace(partial, dest_dir / f.name)
 
 
+class EntityTextCapture:
+    """Record the OCR'd text behind each box Presidio produces.
+
+    Presidio's box list carries coordinates only. Its analyzer maps detected
+    entities to boxes in ``map_analyzer_results_to_bounding_boxes``, where the
+    full OCR text is available, so this wraps that step on one engine and keeps
+    ``text[start:end]`` for every box, in the same order Presidio later writes
+    them to the bounding-box sidecar. Nothing is logged or written outside the
+    temporary staging directory.
+    """
+
+    def __init__(self, engine):
+        self.texts = None
+        analyzer = engine.image_analyzer_engine
+        original = analyzer.map_analyzer_results_to_bounding_boxes
+
+        def wrapped(text_analyzer_results, ocr_result, text, allow_list):
+            boxes = original(text_analyzer_results, ocr_result, text, allow_list)
+            self.texts = [text[b.start:b.end] for b in boxes]
+            return boxes
+
+        analyzer.map_analyzer_results_to_bounding_boxes = wrapped
+
+    def reset(self):
+        self.texts = None
+
+
 def redact_one(engine, input_file: Path, dest_dir: Path, header,
                options: Namespace, extra_kwargs: dict) -> None:
     """Redact ``input_file`` into ``dest_dir``, fail-closed.
@@ -334,6 +363,15 @@ parser.add_argument(
          'Compressed input allowed; outputs are uncompressed. No detected boxes fails.',
 )
 parser.add_argument(
+    '--propagate-match-tags',
+    default=None,
+    help='implies --propagate-bboxes. Comma-separated DICOM keywords (e.g. '
+         'PatientID,PatientName,PatientBirthDate,StudyDate,AccessionNumber,'
+         'InstitutionName). Only detected text matching these header values is '
+         'propagated to the other frames; other detections stay redacted on '
+         'their own frame only. Without this option every detection is propagated',
+)
+parser.add_argument(
     '--copy-others',
     action='store_true',
     default=False,
@@ -418,7 +456,18 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
     if not 0 <= options.ocr_threshold <= 100:
         parser.error('--ocr-threshold must be between 0 and 100')
 
+    match_tags = None
+    if options.propagate_match_tags is not None:
+        match_tags = [t.strip() for t in options.propagate_match_tags.split(',') if t.strip()]
+        if not match_tags:
+            parser.error('--propagate-match-tags needs at least one DICOM keyword')
+        unknown = validate_keywords(match_tags)
+        if unknown:
+            parser.error('--propagate-match-tags: not DICOM keywords: ' + ', '.join(unknown))
+        options.propagate_bboxes = True      # header matching only makes sense for sequences
+
     engine = DicomImageRedactorEngine()
+    capture = EntityTextCapture(engine) if match_tags else None
     recall_tags = [t.strip() for t in options.recall_tags.split(',') if t.strip()]
 
     mapper = PathMapper.file_mapper(
@@ -444,6 +493,16 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
                     if len({src.stem for src, _ in members}) != len(members):
                         raise ValueError('duplicate DICOM stems in sequence')
                     staged_files = []
+                    matcher = None
+                    if match_tags:
+                        matcher = HeaderMatcher(header_values(
+                            [pydicom.dcmread(str(src), stop_before_pixels=True)
+                             for src, _ in members],
+                            match_tags, options.recall_min_len))
+                        if not matcher:
+                            raise ValueError(
+                                'none of the --propagate-match-tags have a usable value '
+                                'in the headers of this sequence')
                     for src, dst in members:
                         header = pydicom.dcmread(str(src), stop_before_pixels=True)
                         reason = unsupported_reason(header)
@@ -458,9 +517,15 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
                         # Force private bounding boxes only in staging.
                         staged_options = SimpleNamespace(**vars(options))
                         staged_options.save_bboxes = True
+                        if capture is not None:
+                            capture.reset()
                         redact_one(engine, src, stage, header, staged_options, extra)
+                        if capture is not None:
+                            if capture.texts is None:
+                                raise ValueError('could not capture detected text for header matching')
+                            entities_path(stage / src.name).write_text(json.dumps(capture.texts))
                         staged_files.append(stage / src.name)
-                    propagate_staged_files(staged_files)
+                    propagate_staged_files(staged_files, matcher)
                     # All frame-level processing and validation completed.
                     # Final output is native Explicit VR Little Endian, even
                     # when Presidio's original input/output was compressed.

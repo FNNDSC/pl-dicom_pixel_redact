@@ -103,6 +103,41 @@ apptainer exec docker://fnndsc/pl-dicom_pixel_redact:latest dicom_pixel_redact \
 
 Run `dicom_pixel_redact --help` for the full list of options.
 
+### Frame sequences: `--propagate-bboxes` and `--propagate-match-tags`
+
+With `--propagate-bboxes`, each input subdirectory is treated as one aligned
+sequence of single-frame images, and the redaction boxes found on any frame
+are applied to every frame (so a frame where OCR missed the text is still
+covered). By default *every* detection is propagated, which can black out
+image content on all frames when OCR or NER misfires on a single one.
+
+`--propagate-match-tags` (which implies `--propagate-bboxes`) narrows this to
+the burned-in text that actually comes from the header. Give the DICOM
+keywords whose values count as PHI:
+
+```shell
+dicom_pixel_redact \
+    --propagate-match-tags PatientName,PatientID,PatientBirthDate,StudyDate,AccessionNumber,InstitutionName \
+    incoming/ outgoing/
+```
+
+Only detections whose text matches one of those header values are propagated
+to the other frames. Dates are matched in their usual printed forms (a stored
+`19620314` also matches `03/14/1962`, `14MAR1962`, `14-03-62`, ...). Every
+other detection is still redacted on the frame where it was found, just not
+copied to the rest of the series. Matching is by text, so:
+
+- a header value that is printed differently from how it is stored, or that
+  OCR misreads, will not be recognized and will not be propagated;
+- if nothing in the sequence matches, the sequence fails (nothing is written)
+  rather than passing through unredacted;
+- header values are never written to the log.
+
+Frames in a sequence may be monochrome or RGB, including planar RGB
+(`PlanarConfiguration` 1), and compressed. Propagated output is always
+written uncompressed as Explicit VR Little Endian, with RGB interleaved
+(`PlanarConfiguration` 0).
+
 ### Exit status and failures
 
 The plugin is **fail-closed**: a file that cannot be redacted is never written

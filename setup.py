@@ -25,7 +25,7 @@ setup(
     author='FNNDSC',
     author_email='dev@babyMRI.org',
     url='https://github.com/FNNDSC/pl-dicom_pixel_redact',
-    py_modules=['dicom_pixel_redact', 'sequence_redaction'],
+    py_modules=['dicom_pixel_redact', 'sequence_redaction', 'header_match'],
     install_requires=[
         'chris_plugin',
         'presidio-image-redactor',
