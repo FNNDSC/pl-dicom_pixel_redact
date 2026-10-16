@@ -58,6 +58,30 @@ def select_matching_boxes(boxes, entity_texts, matcher):
     return [box for box, text in zip(boxes, entity_texts) if matcher.matches(text)]
 
 
+SUPPORTED_BITS = (8, 16)
+SUPPORTED_PHOTOMETRIC = ('MONOCHROME1', 'MONOCHROME2', 'RGB')
+
+
+def _validated_geometry(path):
+    """Read one staged file's header only (no pixel data) and return its geometry.
+
+    Raises for anything propagation cannot handle, so the whole series can be
+    checked before any frame is modified.
+    """
+    import pydicom
+    ds = pydicom.dcmread(str(path), stop_before_pixels=True)
+    if int(ds.get('NumberOfFrames', 1) or 1) != 1:
+        raise ValueError('propagation requires single-frame DICOM')
+    if ds.BitsAllocated not in SUPPORTED_BITS or ds.PhotometricInterpretation not in SUPPORTED_PHOTOMETRIC:
+        raise ValueError('unsupported pixel representation for propagation')
+    # PlanarConfiguration is deliberately not part of the geometry: pydicom
+    # returns (rows, cols, 3) for either layout and frames are written
+    # interleaved, so planar and interleaved frames can be mixed safely.
+    return (int(ds.Rows), int(ds.Columns), int(ds.SamplesPerPixel),
+            int(ds.BitsAllocated), int(ds.PixelRepresentation),
+            str(ds.PhotometricInterpretation))
+
+
 def propagate_staged_files(paths, matcher=None):
     """Apply a common PHI mask to staged 2D DICOMs, including compressed input.
 
@@ -67,26 +91,23 @@ def propagate_staged_files(paths, matcher=None):
 
     Output is always Explicit VR Little Endian, avoiding unsafe recompression.
     The caller is responsible for withholding all output if any frame fails.
+
+    Two passes, so memory does not grow with the length of the series: the first
+    reads only headers and sidecars (validating every frame and building the
+    common mask before anything is modified); the second loads, masks, writes
+    and verifies one frame at a time.
     """
     import pydicom
     from pydicom.uid import ExplicitVRLittleEndian
 
     if not paths:
         raise ValueError('empty frame sequence')
-    datasets = []
+
+    # ---- pass 1: headers and sidecars only
     boxes = []
     shape = None
     for path in paths:
-        ds = pydicom.dcmread(str(path))
-        syntax = ds.file_meta.TransferSyntaxUID
-        if int(ds.get('NumberOfFrames', 1) or 1) != 1:
-            raise ValueError('propagation requires single-frame DICOM')
-        current = (int(ds.Rows), int(ds.Columns), int(ds.SamplesPerPixel),
-                   int(ds.BitsAllocated), int(ds.PixelRepresentation),
-                   str(ds.PhotometricInterpretation))
-        # PlanarConfiguration is deliberately not part of the geometry: pydicom
-        # returns (rows, cols, 3) for either layout and frames are written
-        # interleaved, so planar and interleaved frames can be mixed safely.
+        current = _validated_geometry(path)
         if shape is None:
             shape = current
         elif current != shape:
@@ -102,37 +123,33 @@ def propagate_staged_files(paths, matcher=None):
             frame_boxes = select_matching_boxes(
                 frame_boxes, json.loads(texts_path.read_text()), matcher)
         boxes.append(frame_boxes)
-        datasets.append(ds)
     mask = union_mask(boxes, shape[0], shape[1])
+    del boxes
     if not mask.any():
         raise ValueError(
             'no PHI locations matching the selected header values were detected in '
             'sequence; cannot propagate safely' if matcher is not None else
             'no PHI locations detected in sequence; cannot propagate safely')
+
+    # ---- pass 2: one frame in memory at a time
     # Modify *already-redacted* frames; existing Presidio redactions are preserved.
-    for ds, path in zip(datasets, paths):
-        array = ds.pixel_array
-        masked = apply_mask(array, mask)
-        # Decode already-redacted pixels, then write native uncompressed bytes.
-        # This avoids invoking GDCM RLE compression a second time.
-        # Only support 8/16-bit integer pixels and standard monochrome/RGB.
-        if ds.BitsAllocated not in (8, 16) or ds.PhotometricInterpretation not in (
-            'MONOCHROME1', 'MONOCHROME2', 'RGB'
-        ):
-            raise ValueError('unsupported pixel representation for propagation')
-        if ds.file_meta.TransferSyntaxUID.is_compressed:
-            ds.decompress()
-        # pydicom decompression may change pixel representation; use the
-        # *original* already-redacted decoded pixels captured above.
+    for path in paths:
+        ds = pydicom.dcmread(str(path))
+        masked = apply_mask(ds.pixel_array, mask)        # decodes compressed input once
         ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
         ds.is_little_endian = True
         ds.is_implicit_VR = False
         if ds.SamplesPerPixel == 3:
             ds.PlanarConfiguration = 0              # pixel_array, and so the output, is interleaved
-        ds.PixelData = masked.astype(masked.dtype.newbyteorder('<'), copy=False).tobytes()
-        ds['PixelData'].VR = 'OB' if ds.BitsAllocated <= 8 else 'OW'
+        # A fresh element (rather than assigning .PixelData) drops the "undefined
+        # length" flag an encapsulated element carries, and avoids decompressing
+        # the dataset a second time.
+        ds.add_new(0x7FE00010, 'OB' if ds.BitsAllocated <= 8 else 'OW',
+                   masked.astype(masked.dtype.newbyteorder('<'), copy=False).tobytes())
         ds.save_as(str(path))
+        del ds
         check = pydicom.dcmread(str(path))
         if check.file_meta.TransferSyntaxUID != ExplicitVRLittleEndian or not np.array_equal(check.pixel_array, masked):
             raise ValueError('post-write pixel verification failed')
+        del check, masked
     return int(mask.sum())
